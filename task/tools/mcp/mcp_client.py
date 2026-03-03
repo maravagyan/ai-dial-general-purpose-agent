@@ -1,74 +1,129 @@
-from typing import Optional, Any
+import json
+from typing import Any, Optional
 
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
-from mcp.types import CallToolResult, TextContent, ReadResourceResult, TextResourceContents, BlobResourceContents
-from pydantic import AnyUrl
-
-from task.tools.mcp.mcp_tool_model import MCPToolModel
+import httpx
 
 
 class MCPClient:
-    """Handles MCP server connection and tool execution"""
+    def __init__(self, mcp_url: str):
+        url = mcp_url.rstrip("/")
+        if not url.endswith("/mcp"):
+            url = f"{url}/mcp"
+        self._url = url + "/"
+        self._session_id: Optional[str] = None
+        self._initialized: bool = False
 
-    def __init__(self, mcp_server_url: str) -> None:
-        self.server_url = mcp_server_url
-        self.session: Optional[ClientSession] = None
-        self._streams_context = None
-        self._session_context = None
+    async def _initialize_session(self) -> None:
+        if self._initialized:
+            return
 
-    @classmethod
-    async def create(cls, mcp_server_url: str) -> 'MCPClient':
-        """Async factory method to create and connect MCPClient"""
-        #TODO:
-        # 1. Create instance of MCPClient with `cls`
-        # 2. Connect to MCP server
-        # 3. return created instance
-        raise NotImplementedError()
+        timeout = httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0)
 
-    async def connect(self):
-        """Connect to MCP server"""
-        #TODO:
-        # 1. Check if session is present, if yes just return to finsh execution
-        # 2. Call `streamablehttp_client` method with `server_url` and set as `self._streams_context`
-        # 3. Enter `self._streams_context`, result set as `read_stream, write_stream, _`
-        # 4. Create ClientSession with streams from above and set as `self._session_context`
-        # 5. Enter `self._session_context` and set as self.session
-        # 6. Initialize session and print its result to console
-        raise NotImplementedError()
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": "init",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "general-purpose-agent",
+                        "version": "0.1"
+                    },
+                },
+            }
 
+            async with client.stream(
+                "POST",
+                self._url,
+                headers={
+                    "Accept": "application/json, text/event-stream",
+                    "Content-Type": "application/json",
+                },
+                content=json.dumps(payload).encode("utf-8"),
+            ) as r:
 
-    async def get_tools(self) -> list[MCPToolModel]:
-        """Get available tools from MCP server"""
-        #TODO: Get and return MCP tools as list of MCPToolModel
-        raise NotImplementedError()
+                if r.status_code >= 400:
+                    txt = await r.aread()
+                    raise httpx.HTTPStatusError(
+                        f"HTTP {r.status_code} - {txt.decode()}",
+                        request=r.request,
+                        response=r,
+                    )
 
-    async def call_tool(self, tool_name: str, tool_args: dict[str, Any]) -> Any:
-        """Call a tool on the MCP server"""
-        #TODO: Make tool call and return its result. Do it in proper way (it returns array of content and you need to handle it properly)
-        raise NotImplementedError()
+                # store session id
+                sid = r.headers.get("mcp-session-id")
+                if not sid:
+                    raise RuntimeError("MCP initialize did not return mcp-session-id")
 
-    async def get_resource(self, uri: AnyUrl) -> str | bytes:
-        """Get specific resource content"""
-        #TODO: Get and return resource. Resources can be returned as TextResourceContents and BlobResourceContents, you
-        #      need to return resource value (text or blob)
-        raise NotImplementedError()
+                self._session_id = sid
 
-    async def close(self):
-        """Close connection to MCP server"""
-        #TODO:
-        # 1. Close `self._session_context`
-        # 2. Close `self._streams_context`
-        # 3. Set session, _session_context and _streams_context as None
-        raise NotImplementedError()
+                # consume SSE result
+                async for line in r.aiter_lines():
+                    if line.startswith("data:"):
+                        data = line[len("data:"):].strip()
+                        if not data:
+                            continue
+                        obj = json.loads(data)
+                        if obj.get("id") == "init":
+                            self._initialized = True
+                            return
 
-    async def __aenter__(self):
-        """Async context manager entry"""
-        await self.connect()
-        return self
+        raise RuntimeError("MCP initialize failed")
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        await self.close()
-        return False
+    async def _rpc(self, method: str, params: Any, rpc_id: str) -> dict[str, Any]:
+        await self._initialize_session()
 
+        payload = {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "method": method,
+        }
+        if params is not None:
+            payload["params"] = params
+
+        timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async with client.stream(
+                "POST",
+                self._url,
+                headers={
+                    "Accept": "application/json, text/event-stream",
+                    "Content-Type": "application/json",
+                    "mcp-session-id": self._session_id or "",
+                },
+                content=json.dumps(payload).encode("utf-8"),
+            ) as r:
+
+                if r.status_code >= 400:
+                    txt = await r.aread()
+                    raise httpx.HTTPStatusError(
+                        f"HTTP {r.status_code} - {txt.decode()}",
+                        request=r.request,
+                        response=r,
+                    )
+
+                async for line in r.aiter_lines():
+                    if line.startswith("data:"):
+                        data = line[len("data:"):].strip()
+                        if not data:
+                            continue
+                        obj = json.loads(data)
+                        if obj.get("id") == rpc_id:
+                            if "error" in obj:
+                                raise RuntimeError(obj["error"])
+                            return obj
+
+        raise TimeoutError("No JSON-RPC response received")
+
+    async def list_tools(self) -> list[dict[str, Any]]:
+        resp = await self._rpc("tools/list", None, "1")
+        result = resp.get("result") or {}
+        tools = result.get("tools") or result
+        return tools if isinstance(tools, list) else []
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        resp = await self._rpc("tools/call", {"name": name, "arguments": arguments}, "2")
+        return resp.get("result", resp)

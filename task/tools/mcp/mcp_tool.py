@@ -1,41 +1,38 @@
 import json
-from typing import Any
+from typing import Any, Dict
 
-from aidial_sdk.chat_completion import Message
-
+from aidial_sdk.chat_completion import Message, Role
 from task.tools.base import BaseTool
-from task.tools.mcp.mcp_client import MCPClient
-from task.tools.mcp.mcp_tool_model import MCPToolModel
 from task.tools.models import ToolCallParams
+from task.tools.mcp.mcp_client import MCPClient
 
 
 class MCPTool(BaseTool):
-
-    def __init__(self, client: MCPClient, mcp_tool_model: MCPToolModel):
-        #TODO:
-        # 1. Set client
-        # 2. Set mcp_tool_model
-        raise NotImplementedError()
-
-    async def _execute(self, tool_call_params: ToolCallParams) -> str | Message:
-        #TODO:
-        # 1. Load arguments wit `json`
-        # 2. Get content with mcp client tool call
-        # 3. Append retrieved content to stage
-        # 4. return content
-        raise NotImplementedError()
+    def __init__(self, name: str, description: str, input_schema: Dict[str, Any], client: MCPClient):
+        self.name = name
+        self.description = description
+        self._schema = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": input_schema or {"type": "object", "properties": {}},
+            },
+        }
+        self.client = client
 
     @property
-    def name(self) -> str:
-        # TODO: provide name from mcp_tool_model
-        raise NotImplementedError()
+    def schema(self) -> Dict[str, Any]:
+        return self._schema
 
-    @property
-    def description(self) -> str:
-        # TODO: provide description from mcp_tool_model
-        raise NotImplementedError()
+    async def execute(self, params: ToolCallParams):
+        raw = params.tool_call.function.arguments or "{}"
+        try:
+            arguments = json.loads(raw)
+        except Exception:
+            arguments = {}
 
-    @property
-    def parameters(self) -> dict[str, Any]:
-        # TODO: provide parameters from mcp_tool_model
-        raise NotImplementedError()
+        result = await self.client.call_tool(self.name, arguments)
+
+        # Return text to model (and visible in stage)
+        return Message(role=Role.TOOL, content=json.dumps(result, ensure_ascii=False))
